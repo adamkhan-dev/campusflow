@@ -72,6 +72,13 @@ def _cached_course_label_options() -> list[str]:
     return timetable.get_course_label_options()
 
 
+@st.cache_data(show_spinner=False)
+def _cached_extract_timetable_pdf(pdf_bytes: bytes, file_name: str) -> tuple[list[dict], bool]:
+    """Extract all classes and slots from an uploaded university timetable PDF (cached cleanly)."""
+    _ = file_name
+    return ai_engine.parse_timetable_pdf_with_fallback(pdf_bytes)
+
+
 MATTE_CSS = """
 <style>
 :root { color-scheme: light; --cf-bg:#f8fafc; --cf-card:#ffffff; --cf-border:#e2e8f0; --cf-text:#0f172a; --cf-muted:#64748b; --cf-blue:#0284c7; --cf-blue-soft:#e0f2fe; --cf-green:#16a34a; --cf-amber:#d97706; --primary-color:#0284c7; --background-color:#f8fafc; --secondary-background-color:#ffffff; --text-color:#0f172a; }
@@ -205,6 +212,15 @@ input, textarea, [data-baseweb="select"] > div, [data-testid="stDateInput"] inpu
 .cf-calendar-class small {display:block;font-size:.66rem;color:#475569;line-height:1.4;margin-top:.12rem;}
 .cf-calendar-clash {background:#fff1f2;border-color:#fecdd3;color:#9f1239;}
 .cf-calendar-clash strong {color:#be123c;}
+.cf-step-head {display:flex;justify-content:space-between;align-items:center;gap:.65rem;flex-wrap:wrap;margin-bottom:.45rem;}
+.cf-step-title-group {display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;}
+.cf-step-pill {display:inline-flex;align-items:center;padding:.2rem .65rem;border-radius:999px;background:#0284c7;color:#ffffff!important;font-size:.7rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;}
+.cf-step-title {font-size:1.04rem;font-weight:750;color:#0f172a!important;letter-spacing:-.015em;}
+.cf-alt-row {display:flex;justify-content:space-between;align-items:center;gap:.7rem;flex-wrap:wrap;padding:.58rem .8rem;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;margin:.35rem 0;}
+.cf-alt-row-zero {background:#f0fdf4!important;border-color:#bbf7d0!important;}
+.cf-alt-row-clash {background:#fff7ed!important;border-color:#fed7aa!important;}
+[data-testid="stDownloadButton"] button[kind="primary"] {background:var(--cf-blue)!important;border:1px solid var(--cf-blue)!important;color:#ffffff!important;border-radius:9px!important;font-weight:650!important;}
+[data-testid="stDownloadButton"] button[kind="primary"] * {color:#ffffff!important;}
 @media (max-width: 900px) {.block-container{padding-left:1rem!important;padding-right:1rem!important;}.cf-study-card{padding:.85rem!important;}}
 </style>
 """
@@ -1887,523 +1903,605 @@ with tab_practice:
 
 
 # ===========================================================================
-# TAB 4: COMSATS Fall 2026 Timetable, Clash & Prerequisite Solver
+# TAB 4: Full CS Master Timetable, Remaining Course Clash Solver & PDF Export
 # ===========================================================================
 with tab_schedule:
+    if not st.session_state.get("t4_hydrated"):
+        db_pdf_rows, db_pdf_name = database.load_uploaded_pdf_catalog()
+        if db_pdf_rows:
+            st.session_state["t4_pdf_rows"] = db_pdf_rows
+            st.session_state["t4_pdf_name"] = db_pdf_name or "Uploaded_Timetable.pdf"
+            st.session_state["t4_pdf_source_note"] = "Merged locally from saved Timetable PDF"
+        saved_plan_meta = database.load_planner_state()
+        if saved_plan_meta:
+            reg_sec_saved = str(
+                saved_plan_meta.get("regular_section")
+                or (
+                    f"{saved_plan_meta.get('program', '')}-{saved_plan_meta.get('section_code', '')}"
+                    if saved_plan_meta.get("program") and saved_plan_meta.get("section_code")
+                    else "BCS-5A"
+                )
+            )
+            st.session_state["t4_regular_section"] = reg_sec_saved
+            st.session_state["t4_prev_regular_section"] = reg_sec_saved
+            if isinstance(saved_plan_meta.get("remaining_courses"), list):
+                st.session_state["t4_remaining_courses"] = list(saved_plan_meta["remaining_courses"])
+            if isinstance(saved_plan_meta.get("remaining_sections"), dict):
+                st.session_state["t4_remaining_sections"] = {
+                    str(k): str(v) for k, v in saved_plan_meta["remaining_sections"].items()
+                }
+            if isinstance(saved_plan_meta.get("regular_swaps"), dict):
+                st.session_state["t4_regular_swaps"] = {
+                    str(k): str(v) for k, v in saved_plan_meta["regular_swaps"].items()
+                }
+        st.session_state["t4_hydrated"] = True
+
+    if "t4_pending_updates" in st.session_state:
+        pending_u = st.session_state.pop("t4_pending_updates")
+        for pk, pv in pending_u.items():
+            st.session_state[pk] = pv
+
+    # Build unified CS Department Master Timetable (built-in catalog + any uploaded PDF)
+    builtin_master_df = timetable.get_cs_master_catalog_df()
+    loaded_pdf_rows = list(st.session_state.get("t4_pdf_rows") or [])
+    loaded_pdf_name = str(st.session_state.get("t4_pdf_name") or "")
+    uploaded_pdf_df = (
+        timetable.slots_list_to_df(loaded_pdf_rows).drop(columns=["id"], errors="ignore")
+        if loaded_pdf_rows
+        else builtin_master_df.iloc[0:0].copy()
+    )
+    master_catalog_df = timetable.merge_pdf_catalog_with_master(uploaded_pdf_df, builtin_master_df)
+    all_sections_count = int(master_catalog_df["section"].nunique()) if not master_catalog_df.empty else 0
+    all_courses_count = int(master_catalog_df["course_code"].nunique()) if not master_catalog_df.empty else 0
+
+    catalog_pill = (
+        f"CS Master Timetable + PDF ({loaded_pdf_name})"
+        if loaded_pdf_name and loaded_pdf_rows
+        else f"Built-in CS Master ({all_sections_count} Sections · {all_courses_count} Courses)"
+    )
     _render_html(
-        """
+        f"""
         <div style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.25rem;">
-            <span style="color:#0f172a;font-size:1.25rem;font-weight:750;">Student Timetable, Clash &amp; Prerequisite Solver</span>
-            <span class="cf-pill-active">COMSATS Fall 2026 Catalogue Loaded</span>
+            <span style="color:#0f172a;font-size:1.25rem;font-weight:750;">CS Department Timetable Clash &amp; Repeater Solver</span>
+            <span class="cf-pill-active">{html.escape(catalog_pill)}</span>
         </div>
         """
     )
     st.caption(
-        "Select your regular home class and any remaining/repeat courses. CampusFlow detects weekly "
-        "time clashes (lectures, 3-hour labs, Saturday seminars), verifies prerequisites, suggests "
-        "clash-free alternative classes, and builds your final conflict-free weekly timetable."
+        "Select your regular class/section to load all regular courses automatically, pick any remaining or failed courses, "
+        "inspect clash-free sections and smart swaps across all CS classes & RPT-CS, and download your final timetable PDF."
     )
 
-    catalog_df = _cached_combined_comsats_catalog().copy()
-    catalog_source_note = (
-        "Loaded official COMSATS Fall 2026 CS timetable (BCS-1A, BCS-1B, BSE-1, BAI-1, BDS-1, BCT-1) "
-        "plus upper-semester sections (BCS-5A, BCS-5B)."
-    )
-    prerequisite_map = dict(timetable.COURSE_PREREQUISITES)
-
-    with st.expander("Upload Official COMSATS Timetable (PDF or CSV)", expanded=False):
-        uploaded_catalog_file = st.file_uploader(
-            "Upload timetable PDF or CSV to override/load custom sections",
-            type=["pdf", "csv"],
-            key="cf_official_catalog_file",
-            help=(
-                "Accepts COMSATS Fall 2026 PDFs or CSV files with columns: course_code, course_name, "
-                "section, day, start_time, end_time, room, instructor (optional: prerequisites)."
-            ),
-        )
-        st.download_button(
-            "Download timetable CSV template",
-            data="course_code,course_name,section,day,start_time,end_time,room,instructor,prerequisites\n".encode("utf-8"),
-            file_name="campusflow_timetable_template.csv",
-            mime="text/csv",
-        )
-
-    if uploaded_catalog_file is not None:
-        fname_low = (uploaded_catalog_file.name or "").lower()
-        if fname_low.endswith(".pdf"):
-            raw_pdf_bytes = uploaded_catalog_file.getvalue()
-            pdf_cache_sig = f"{uploaded_catalog_file.name}:{len(raw_pdf_bytes)}"
-            if st.session_state.get("cf_parsed_pdf_sig") != pdf_cache_sig:
-                with st.spinner("Extracting timetable sections & lab slots from uploaded PDF..."):
-                    parsed_rows, used_pdf_ai = ai_engine.parse_timetable_pdf_with_fallback(raw_pdf_bytes)
-                st.session_state["cf_parsed_pdf_sig"] = pdf_cache_sig
-                st.session_state["cf_parsed_pdf_rows"] = parsed_rows
-                st.session_state["cf_parsed_pdf_ai"] = used_pdf_ai
-            parsed_rows = st.session_state.get("cf_parsed_pdf_rows") or []
-            used_pdf_ai = bool(st.session_state.get("cf_parsed_pdf_ai", False))
-            if parsed_rows:
-                parsed_df = timetable.slots_list_to_df(parsed_rows).drop(columns=["id"], errors="ignore")
-                catalog_df = parsed_df
-                parser_tag = "✨ Gemini AI PDF Extraction" if used_pdf_ai else "Official COMSATS PDF Parser"
-                catalog_source_note = (
-                    f"Using uploaded PDF '{uploaded_catalog_file.name}' ({len(catalog_df)} meetings across "
-                    f"{catalog_df['section'].nunique()} sections via {parser_tag})."
-                )
-                st.success(
-                    f"Extracted {len(catalog_df)} class meetings across {catalog_df['section'].nunique()} "
-                    f"sections from {uploaded_catalog_file.name}."
-                )
-            else:
-                st.warning(
-                    f"Could not extract structured section slots from '{uploaded_catalog_file.name}'. "
-                    "Falling back to the bundled COMSATS Fall 2026 catalogue."
-                )
-        else:
-            try:
-                imported = pd.read_csv(uploaded_catalog_file)
-                imported.columns = [str(c).strip().lower() for c in imported.columns]
-                required_catalog_cols = [
-                    "course_code", "course_name", "section", "day",
-                    "start_time", "end_time", "room", "instructor",
-                ]
-                missing_catalog_cols = [c for c in required_catalog_cols if c not in imported.columns]
-                if missing_catalog_cols:
-                    st.error("Timetable CSV is missing required columns: " + ", ".join(missing_catalog_cols))
-                    catalog_df = pd.DataFrame(columns=required_catalog_cols)
-                else:
-                    catalog_df = imported[required_catalog_cols].copy()
-                    for col in required_catalog_cols:
-                        catalog_df[col] = catalog_df[col].fillna("").astype(str).str.strip()
-                    catalog_df["course_code"] = catalog_df["course_code"].str.upper()
-                    catalog_df["day"] = catalog_df["day"].str.title().str[:3]
-                    if "prerequisites" in imported.columns:
-                        prerequisite_map = {
-                            str(row["course_code"]).upper(): tuple(
-                                x.strip().upper()
-                                for x in str(row.get("prerequisites", "")).split(",")
-                                if x.strip() and x.strip().lower() not in {"nan", "none", "n/a"}
-                            )
-                            for _, row in imported.iterrows()
-                        }
-                    catalog_source_note = f"Using uploaded CSV '{uploaded_catalog_file.name}' ({len(catalog_df)} meetings)."
-                    st.success(f"Loaded {len(catalog_df)} class meetings from {uploaded_catalog_file.name}.")
-            except Exception as exc:
-                st.error(f"Could not read timetable CSV: {exc}")
-                catalog_df = pd.DataFrame()
-    else:
-        st.info(catalog_source_note)
-
-    if catalog_df.empty:
-        st.warning("No section catalogue is configured. Import a verified university timetable to use the planner.")
-    else:
-        preferred_order = ["BCS-5A", "BCS-5B", "BCS-1A", "BCS-1B", "BSE-1", "BAI-1", "BDS-1", "BCT-1"]
-        raw_sections = catalog_df["section"].dropna().astype(str).unique().tolist()
-        cohort_options = [s for s in preferred_order if s in raw_sections] + sorted(
-            s for s in raw_sections if s not in preferred_order
-        )
-        course_codes = sorted(catalog_df["course_code"].dropna().astype(str).str.upper().unique().tolist())
-
-        if "cf_pending_sec_updates" in st.session_state:
-            pending_map = st.session_state.pop("cf_pending_sec_updates")
-            saved_ex = st.session_state.setdefault("cf_saved_extra_secs", {})
-            for s_key, s_val in pending_map.items():
-                st.session_state[s_key] = s_val
-                if s_key.startswith("cf_extra_sec_"):
-                    saved_ex[s_key[len("cf_extra_sec_"):]] = s_val
-
-        default_cohort = (
-            st.session_state.get("cf_planner_cohort")
-            or st.session_state.get("cf_saved_cohort")
-            or "BCS-5A"
-        )
-        if default_cohort not in cohort_options:
-            default_cohort = cohort_options[0]
-        if "cf_planner_cohort" not in st.session_state:
-            st.session_state["cf_planner_cohort"] = default_cohort
-        st.session_state["cf_saved_cohort"] = default_cohort
-
-        def _default_planner_sets(target_cohort: str) -> tuple[list[str], list[str], str]:
-            reg_def = [c for c in timetable.get_cohort_default_courses(catalog_df, target_cohort) if c in course_codes]
-            if target_cohort == "BCS-5A" and all(c in course_codes for c in ("CSC322", "CSC325", "CSC301")):
-                reg_def = ["CSC322", "CSC325", "CSC301"]
-                ext_def = [c for c in ["AIC354", "CSC101"] if c in course_codes and c not in reg_def]
-                comp_def = "CSC101, CSC103, CSC241, CSC211"
-                return reg_def, ext_def, comp_def
-            if target_cohort.startswith("BCS-5"):
-                comp_def = "CSC101, CSC103, CSC241, CSC211"
-            else:
-                comp_def = ""
-            return reg_def, [], comp_def
-
-        if st.session_state.get("cf_prev_cohort") != default_cohort:
-            reg_init, ext_init, comp_init = _default_planner_sets(default_cohort)
-            st.session_state["cf_saved_reg_courses"] = list(reg_init)
-            st.session_state["cf_saved_extra_courses"] = list(ext_init)
-            st.session_state["cf_saved_completed_courses"] = comp_init
-            st.session_state["cf_saved_extra_secs"] = {}
-            st.session_state["cf_reg_courses"] = list(reg_init)
-            st.session_state["cf_extra_courses"] = list(ext_init)
-            st.session_state["cf_completed_courses"] = comp_init
-            st.session_state["cf_prev_cohort"] = default_cohort
-        else:
-            raw_reg = (
-                st.session_state["cf_reg_courses"]
-                if "cf_reg_courses" in st.session_state
-                else st.session_state.get("cf_saved_reg_courses", [])
+    # Optional Full CS Timetable PDF Uploader (auto-merges into built-in catalog)
+    with st.container(border=True):
+        up_hdr_l, up_hdr_r = st.columns([2.6, 1.15], gap="medium")
+        with up_hdr_l:
+            _render_html(
+                """
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.25rem;">
+                    <span class="cf-source-pill">Optional PDF Merge</span>
+                    <strong style="color:#0f172a;font-size:0.93rem;">Upload Full CS Timetable PDF</strong>
+                </div>
+                """
             )
-            clean_reg = [c for c in raw_reg if c in course_codes]
-            st.session_state["cf_reg_courses"] = clean_reg
-            st.session_state["cf_saved_reg_courses"] = list(clean_reg)
-
-            reg_set_now = set(clean_reg)
-            raw_ext = (
-                st.session_state["cf_extra_courses"]
-                if "cf_extra_courses" in st.session_state
-                else st.session_state.get("cf_saved_extra_courses", [])
+            uploaded_pdf = st.file_uploader(
+                "Upload Full CS Timetable PDF",
+                type=["pdf"],
+                key="t4_pdf_uploader",
+                label_visibility="collapsed",
+                help="Extracts all sections and courses from any uploaded CS timetable PDF and merges them into the master catalog automatically.",
             )
-            clean_ext = [c for c in raw_ext if c in course_codes and c not in reg_set_now]
-            st.session_state["cf_extra_courses"] = clean_ext
-            st.session_state["cf_saved_extra_courses"] = list(clean_ext)
-
-            if "cf_completed_courses" not in st.session_state:
-                st.session_state["cf_completed_courses"] = st.session_state.get(
-                    "cf_saved_completed_courses", ""
-                )
-
-        with st.container(border=True):
-            st.markdown("#### 1. Select Your Regular Class & Remaining Courses")
-            p1, p2, p3 = st.columns([0.9, 1.45, 1.45], gap="medium")
-            with p1:
-                cohort = st.selectbox(
-                    "Your regular class / section",
-                    cohort_options,
-                    index=cohort_options.index(default_cohort),
-                    key="cf_planner_cohort",
-                )
-                st.session_state["cf_saved_cohort"] = cohort
-            with p2:
-                regular_courses = st.multiselect(
-                    "Regular class courses",
-                    options=course_codes,
-                    format_func=lambda code: timetable.format_course_label(code, catalog_df),
-                    key="cf_reg_courses",
-                    help="Core courses offered with your regular class section.",
-                )
-                st.session_state["cf_saved_reg_courses"] = list(regular_courses)
-            with p3:
-                extra_pool = [c for c in course_codes if c not in regular_courses]
-                extra_courses = st.multiselect(
-                    "Remaining / repeat / extra courses",
-                    options=extra_pool,
-                    format_func=lambda code: timetable.format_course_label(code, catalog_df),
-                    key="cf_extra_courses",
-                    help="Select backlog, failed, repeat, or extra courses to fit around your regular classes.",
-                )
-                st.session_state["cf_saved_extra_courses"] = list(extra_courses)
-
-            completed_text = st.text_input(
-                "Previously completed course codes (comma-separated, for prerequisite check)",
-                key="cf_completed_courses",
-                placeholder="e.g. CSC101, CSC103, CSC241, CSC211",
-                help="Checks prerequisite eligibility whenever rules exist in the catalogue.",
-            )
-            st.session_state["cf_saved_completed_courses"] = completed_text
-
-            extra_section_choices: dict[str, str] = {}
-            saved_extra_secs = st.session_state.setdefault("cf_saved_extra_secs", {})
-            if extra_courses:
-                st.markdown("##### Starting section for remaining / extra courses")
-                ex_cols = st.columns(min(3, len(extra_courses)))
-                for idx, code in enumerate(extra_courses):
-                    opts = timetable.section_options_for_course(catalog_df, code)
-                    if not opts:
-                        continue
-                    def_sec = cohort if cohort in opts else opts[0]
-                    sec_key = f"cf_extra_sec_{code}"
-                    cur_sec_val = st.session_state.get(sec_key) or saved_extra_secs.get(code) or def_sec
-                    if cur_sec_val not in opts:
-                        cur_sec_val = def_sec
-                    st.session_state[sec_key] = cur_sec_val
-                    with ex_cols[idx % len(ex_cols)]:
-                        chosen_ex_sec = st.selectbox(
-                            f"{code} starting section",
-                            opts,
-                            key=sec_key,
-                        )
-                        extra_section_choices[code] = chosen_ex_sec
-                        saved_extra_secs[code] = chosen_ex_sec
-
-            all_selected_courses = list(dict.fromkeys(regular_courses + extra_courses))
-            gen_col, clr_col = st.columns([2.2, 1], gap="small")
-            check_clicked = gen_col.button(
-                "Check Clashes, Prerequisites & Build Timetable",
-                type="primary",
+        with up_hdr_r:
+            _render_html("<div style='height:1.55rem;'></div>")
+            clear_pdf_clicked = st.button(
+                "Reset to Built-in Master",
+                key="t4_clear_pdf",
                 width="stretch",
-                disabled=not all_selected_courses,
+                disabled=not bool(loaded_pdf_rows),
             )
-            reset_plan = clr_col.button("Clear saved plan", width="stretch")
 
-        if reset_plan:
-            database.save_student_schedule([])
-            st.session_state.pop("cf_student_plan", None)
-            st.session_state.pop("cf_solver_meta", None)
-            st.session_state.pop("cf_timetable_advisor", None)
+        if clear_pdf_clicked:
+            database.clear_uploaded_pdf_catalog()
+            st.session_state["t4_dismissed_pdf_sig"] = str(st.session_state.get("t4_pdf_sig") or "")
+            for k_clear in ("t4_pdf_rows", "t4_pdf_name", "t4_pdf_sig", "t4_pdf_source_note"):
+                st.session_state.pop(k_clear, None)
             st.rerun()
 
-        if check_clicked:
-            completed_list = [x.strip().upper() for x in completed_text.split(",") if x.strip()]
-            initial_sec_map: dict[str, str] = {}
-            for rc in regular_courses:
-                r_opts = timetable.section_options_for_course(catalog_df, rc)
-                if r_opts:
-                    initial_sec_map[rc] = cohort if cohort in r_opts else r_opts[0]
-            for ec, sec_val in extra_section_choices.items():
-                initial_sec_map[ec] = sec_val
+        if uploaded_pdf is None:
+            st.session_state.pop("t4_dismissed_pdf_sig", None)
+        else:
+            raw_pdf_bytes = uploaded_pdf.getvalue()
+            pdf_sig = f"{uploaded_pdf.name}:{len(raw_pdf_bytes)}"
+            if (
+                st.session_state.get("t4_pdf_sig") != pdf_sig
+                and st.session_state.get("t4_dismissed_pdf_sig") != pdf_sig
+            ):
+                st.session_state.pop("t4_dismissed_pdf_sig", None)
+                with st.spinner(f"Extracting sections & courses from '{uploaded_pdf.name}'..."):
+                    parsed_rows, used_ai = _cached_extract_timetable_pdf(raw_pdf_bytes, uploaded_pdf.name)
+                st.session_state["t4_pdf_sig"] = pdf_sig
+                if parsed_rows:
+                    st.session_state["t4_pdf_rows"] = parsed_rows
+                    st.session_state["t4_pdf_name"] = uploaded_pdf.name
+                    st.session_state["t4_pdf_source_note"] = (
+                        "Merged via Gemini fallback" if used_ai else "Extracted locally via pure-Python PDF parser"
+                    )
+                    database.save_uploaded_pdf_catalog(parsed_rows, uploaded_pdf.name)
+                    st.rerun()
+                else:
+                    st.warning(
+                        f"Could not find tabular timetable rows in '{uploaded_pdf.name}'. Using built-in CS Master Timetable."
+                    )
 
-            solver_report = timetable.solve_personalized_timetable(
-                catalog_df=catalog_df,
-                cohort_section=cohort,
-                regular_courses=regular_courses,
-                extra_courses=extra_courses,
-                initial_sections=initial_sec_map,
-                completed_courses=completed_list,
-                prerequisite_map=prerequisite_map,
+        if loaded_pdf_rows:
+            pdf_sec_cnt = len({timetable.normalize_class_section(str(r.get("section") or "")) for r in loaded_pdf_rows})
+            st.success(
+                f"Merged {len(loaded_pdf_rows)} PDF slots across {pdf_sec_cnt} sections from '{loaded_pdf_name}' "
+                f"into the CS Master Timetable ({st.session_state.get('t4_pdf_source_note', 'Cached')})."
             )
 
-            init_df = solver_report["initial_schedule_df"]
-            init_clashes = solver_report["initial_clashes_df"]
-            prereq_list = solver_report["prerequisite_report"]
-            swaps_applied = solver_report["swaps_applied"]
+    # Refresh master catalog after possible PDF merge state
+    loaded_pdf_rows = list(st.session_state.get("t4_pdf_rows") or [])
+    loaded_pdf_name = str(st.session_state.get("t4_pdf_name") or "")
+    uploaded_pdf_df = (
+        timetable.slots_list_to_df(loaded_pdf_rows).drop(columns=["id"], errors="ignore")
+        if loaded_pdf_rows
+        else builtin_master_df.iloc[0:0].copy()
+    )
+    master_catalog_df = timetable.merge_pdf_catalog_with_master(uploaded_pdf_df, builtin_master_df)
+    regular_section_options = timetable.get_regular_class_section_options(master_catalog_df)
 
-            clash_lines = [
-                f"{r['day']} {r['slot_a']} ({r['course_a']} {r['section_a']}) vs "
-                f"{r['slot_b']} ({r['course_b']} {r['section_b']})"
-                for _, r in init_clashes.iterrows()
-            ]
-            prereq_issues = [
-                f"{p['course_code']} missing {', '.join(p['missing'])}"
-                for p in prereq_list
-                if p.get("status") == "ineligible"
-            ]
-            swap_lines = [
-                f"{s['course_code']}: {s['from_section']} → {s['to_section']} ({s['schedule_summary']})"
-                for s in swaps_applied
-            ]
+    default_reg = "BCS-5A" if "BCS-5A" in regular_section_options else regular_section_options[0]
+    if st.session_state.get("t4_regular_section") not in regular_section_options:
+        st.session_state["t4_regular_section"] = default_reg
 
-            with st.spinner("Checking clashes, prerequisites & alternative classes..."):
-                advisor_text, advisor_fb = ai_engine.generate_timetable_advice_with_timeout(
-                    cohort_section=cohort,
-                    clash_lines=clash_lines,
-                    prereq_issues=prereq_issues,
-                    swap_lines=swap_lines,
-                    solved_zero_clash=bool(solver_report["solved_zero_clash"]),
-                    locked_cohort_preserved=bool(solver_report["locked_cohort_preserved"]),
-                    timeout_seconds=10.0,
-                )
+    # -----------------------------------------------------------------------
+    # STEP 1: Select Your Regular Class / Section (auto-loads regular courses)
+    # -----------------------------------------------------------------------
+    with st.container(border=True):
+        cur_preview_sec = str(st.session_state.get("t4_regular_section") or default_reg)
+        _render_html(
+            f"""
+            <div class="cf-step-head">
+                <div class="cf-step-title-group">
+                    <span class="cf-step-pill">Step 1</span>
+                    <span class="cf-step-title">Select Your Regular Class / Section</span>
+                </div>
+                <span class="cf-pill-active">Regular Class: {html.escape(cur_preview_sec)}</span>
+            </div>
+            """
+        )
 
-            database.save_student_schedule(init_df.to_dict(orient="records"))
-            st.session_state["cf_student_plan"] = init_df.to_dict(orient="records")
-            st.session_state["cf_prereq_results"] = prereq_list
-            st.session_state["cf_solver_meta"] = {
-                "cohort_section": cohort,
-                "regular_courses": list(regular_courses),
-                "extra_courses": list(extra_courses),
-                "solved_zero_clash": bool(solver_report["solved_zero_clash"]),
-                "locked_cohort_preserved": bool(solver_report["locked_cohort_preserved"]),
-                "swaps_applied": swaps_applied,
-                "final_schedule_records": solver_report["final_schedule_df"].to_dict(orient="records"),
-                "final_sections": dict(solver_report["final_sections"]),
-            }
-            st.session_state["cf_timetable_advisor"] = {
-                "text": advisor_text,
-                "used_fallback": advisor_fb,
-            }
-            st.rerun()
+        s1_l, s1_r = st.columns([1.6, 1], gap="medium")
+        with s1_l:
+            selected_regular_section = st.selectbox(
+                "1. Select Your Regular Class / Section",
+                options=regular_section_options,
+                key="t4_regular_section",
+                help="All regular courses for your selected class load automatically—no manual course picking needed.",
+            )
+        if st.session_state.get("t4_prev_regular_section") != selected_regular_section:
+            st.session_state["t4_prev_regular_section"] = selected_regular_section
+            st.session_state["t4_regular_swaps"] = {}
+            st.session_state["t4_remaining_sections"] = {}
 
-        current_plan = database.load_student_schedule()
-        plan_df = timetable.slots_list_to_df(current_plan)
+        regular_swaps_map: dict[str, str] = dict(st.session_state.get("t4_regular_swaps") or {})
+        regular_courses = timetable.get_cohort_default_courses(master_catalog_df, selected_regular_section)
+        regular_sections_map = {
+            c: str(regular_swaps_map.get(c) or selected_regular_section)
+            for c in regular_courses
+        }
 
-        if current_plan:
-            st.markdown("#### 2. Clash, Prerequisite & AI Alternative Class Advisor")
-            solver_meta = st.session_state.get("cf_solver_meta") or {}
-            prereq_results = st.session_state.get("cf_prereq_results") or timetable.evaluate_prerequisites(
-                sorted(plan_df["course_code"].astype(str).str.upper().unique().tolist()),
-                [x.strip().upper() for x in st.session_state.get("cf_completed_courses", "").split(",") if x.strip()],
-                prerequisite_map,
+        norm_sec_col = master_catalog_df["section"].astype(str).apply(timetable.normalize_class_section)
+        reg_frames: list[pd.DataFrame] = []
+        for reg_c in regular_courses:
+            assigned_sec = timetable.normalize_class_section(regular_sections_map[reg_c])
+            rows_rc = master_catalog_df.loc[
+                (master_catalog_df["course_code"].astype(str).str.upper() == reg_c)
+                & (norm_sec_col == assigned_sec)
+            ].copy()
+            if not rows_rc.empty:
+                reg_frames.append(rows_rc)
+        base_regular_df = (
+            pd.concat(reg_frames, ignore_index=True)
+            if reg_frames
+            else master_catalog_df.iloc[0:0].copy()
+        )
+        if not base_regular_df.empty:
+            day_ord = {d: i for i, d in enumerate(timetable.COMSATS_ALL_DAYS)}
+            base_regular_df["_d"] = base_regular_df["day"].map(day_ord).fillna(99)
+            base_regular_df = (
+                base_regular_df.sort_values(["_d", "start_time", "course_code"])
+                .drop(columns=["_d"])
+                .reset_index(drop=True)
             )
 
-            pre_cols = st.columns(min(4, max(1, len(prereq_results))), gap="small")
-            for p_idx, result in enumerate(prereq_results):
-                code = result["course_code"]
-                with pre_cols[p_idx % len(pre_cols)]:
-                    if result["status"] == "eligible":
-                        st.success(f"{code}: Prerequisites satisfied")
-                    elif result["status"] == "ineligible":
-                        st.error(f"{code}: Missing prereq ({', '.join(result['missing'])})")
-                    else:
-                        st.info(f"{code}: No prereq rule in catalogue")
-
-            advisor_state = st.session_state.get("cf_timetable_advisor")
-            if advisor_state and advisor_state.get("text"):
-                adv_badge = (
-                    "Deterministic Clash & Prerequisite Solver"
-                    if advisor_state.get("used_fallback")
-                    else "✨ Gemini AI Timetable Advisor"
-                )
-                _render_html(
-                    f"""
-                    <div class="cf-advisor-box">
-                        <span class="cf-advisor-label">{html.escape(adv_badge)}</span>
-                        <div>{html.escape(advisor_state['text'])}</div>
-                    </div>
-                    """
-                )
-
-            plan_clashes = timetable.detect_clashes(plan_df)
-            if plan_clashes.empty:
-                st.success("No timetable clashes detected — your weekly classes do not overlap.")
+        with s1_r:
+            _render_html("<div style='height:1.55rem;'></div>")
+            if regular_swaps_map:
+                if st.button("Reset Combined Swaps", key="t4_reset_reg_swaps", width="stretch"):
+                    st.session_state["t4_regular_swaps"] = {}
+                    st.rerun()
             else:
-                st.warning(
-                    f"{len(plan_clashes)} timetable clash(es) detected in your current sections. "
-                    "Apply the suggested clash-free alternatives below to build your final timetable."
-                )
-                st.dataframe(plan_clashes, width="stretch", hide_index=True)
+                st.metric("Auto-Loaded Regular Courses", len(regular_courses))
 
-                swaps_list = list(solver_meta.get("swaps_applied") or [])
-                final_records = list(solver_meta.get("final_schedule_records") or [])
-                if solver_meta.get("solved_zero_clash") and swaps_list and final_records:
-                    with st.container(border=True):
-                        cohort_keep_note = (
-                            f"Your regular {solver_meta.get('cohort_section', cohort)} classes stay unchanged."
-                            if solver_meta.get("locked_cohort_preserved")
-                            else "Minimal section swaps eliminate every weekly overlap."
-                        )
-                        _render_html(
-                            f"""
-                            <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.45rem;">
-                                <span style="color:#0f172a;font-size:0.96rem;font-weight:700;">Recommended Clash-Free Alternative Classes</span>
-                                <span class="cf-badge-ok">0 remaining clashes</span>
-                            </div>
-                            <div class="cf-muted" style="margin-bottom:0.55rem;">{html.escape(cohort_keep_note)}</div>
-                            """
-                        )
-                        for sw in swaps_list:
-                            tag_txt = "Regular Class" if sw.get("is_regular") else "Remaining / Extra"
+        if regular_courses:
+            chips_html = " ".join(
+                f'<span class="cf-source-pill">{html.escape(timetable.format_course_label(c, master_catalog_df))}'
+                + (
+                    f' [{html.escape(regular_sections_map[c])}]'
+                    if regular_sections_map[c] != selected_regular_section
+                    else ""
+                )
+                + "</span>"
+                for c in regular_courses
+            )
+            _render_html(f'<div style="margin:0.25rem 0 0.6rem 0;display:flex;flex-wrap:wrap;gap:0.35rem;">{chips_html}</div>')
+            st.markdown(f"##### Base Regular Weekly Timetable — {selected_regular_section}")
+            _render_weekly_timetable(timetable.build_weekly_matrix(base_regular_df))
+        else:
+            st.warning(f"No regular courses found for {selected_regular_section} in the active catalog.")
+
+    # -----------------------------------------------------------------------
+    # STEP 2: Select Your Remaining / Repeater Courses
+    # -----------------------------------------------------------------------
+    all_master_codes = sorted(
+        master_catalog_df["course_code"].dropna().astype(str).str.upper().unique().tolist()
+    )
+    reg_set = set(regular_courses)
+    remaining_pool = [c for c in all_master_codes if c not in reg_set]
+    existing_rem = [c for c in (st.session_state.get("t4_remaining_courses") or []) if c in remaining_pool]
+    st.session_state["t4_remaining_courses"] = existing_rem
+
+    with st.container(border=True):
+        _render_html(
+            """
+            <div class="cf-step-head">
+                <div class="cf-step-title-group">
+                    <span class="cf-step-pill">Step 2</span>
+                    <span class="cf-step-title">Select Your Remaining / Repeater Courses</span>
+                </div>
+                <span class="cf-muted" style="font-size:0.78rem;">Automatic prerequisite chain validation included</span>
+            </div>
+            """
+        )
+        selected_remaining = st.multiselect(
+            "2. Select Your Remaining / Repeater Courses",
+            options=remaining_pool,
+            format_func=lambda c: timetable.format_course_label(c, master_catalog_df),
+            key="t4_remaining_courses",
+            help="All non-regular courses from the CS Master Timetable are listed here.",
+        )
+
+        # Clean out removed courses from chosen sections map
+        rem_sec_map: dict[str, str] = {
+            c: str(v)
+            for c, v in (st.session_state.get("t4_remaining_sections") or {}).items()
+            if c in selected_remaining
+        }
+        st.session_state["t4_remaining_sections"] = rem_sec_map
+
+        prereq_warnings = timetable.check_failed_prereq_impacts_for_regular(
+            regular_courses=regular_courses,
+            failed_courses=selected_remaining,
+            catalog_df=master_catalog_df,
+        )
+        if prereq_warnings:
+            for pw in prereq_warnings:
+                st.warning(f"**{pw['headline']}**  \n{pw['detail']}")
+        elif selected_remaining:
+            st.info(
+                f"Prerequisite Check: None of your selected remaining courses ({', '.join(selected_remaining)}) "
+                f"block any current regular course in {selected_regular_section}."
+            )
+
+    # -----------------------------------------------------------------------
+    # STEP 3: Automatic Clash Check Across All Other Classes & Repeater Sections
+    # -----------------------------------------------------------------------
+    with st.container(border=True):
+        _render_html(
+            """
+            <div class="cf-step-head">
+                <div class="cf-step-title-group">
+                    <span class="cf-step-pill">Step 3</span>
+                    <span class="cf-step-title">Automatic Clash Check Across All Other Classes &amp; Repeater Sections</span>
+                </div>
+                <span class="cf-muted" style="font-size:0.78rem;">Compares Theory + Lab times (`start_a &lt; end_b and start_b &lt; end_a`)</span>
+            </div>
+            """
+        )
+
+        if not selected_remaining:
+            st.info(
+                "Select one or more remaining / failed courses in Step 2 above to check every CS class and RPT-CS repeater section automatically."
+            )
+        else:
+            for rem_code in selected_remaining:
+                # Baseline against which this course is checked = regular schedule + any OTHER already-chosen remaining courses
+                other_rem_frames: list[pd.DataFrame] = []
+                for other_c, other_s in rem_sec_map.items():
+                    if other_c == rem_code:
+                        continue
+                    o_rows = master_catalog_df.loc[
+                        (master_catalog_df["course_code"].astype(str).str.upper() == other_c)
+                        & (norm_sec_col == timetable.normalize_class_section(other_s))
+                    ].copy()
+                    if not o_rows.empty:
+                        other_rem_frames.append(o_rows)
+
+                locked_others_df = (
+                    pd.concat(other_rem_frames, ignore_index=True)
+                    if other_rem_frames
+                    else master_catalog_df.iloc[0:0].copy()
+                )
+                baseline_df = (
+                    pd.concat([base_regular_df, locked_others_df], ignore_index=True)
+                    if not locked_others_df.empty
+                    else base_regular_df
+                )
+
+                section_checks = timetable.analyze_remaining_course_sections(
+                    remaining_code=rem_code,
+                    baseline_schedule_df=baseline_df,
+                    master_catalog_df=master_catalog_df,
+                )
+                clash_free_secs = [s for s in section_checks if not s["has_clash"]]
+                clashing_secs = [s for s in section_checks if s["has_clash"]]
+                chosen_sec_for_rem = timetable.normalize_class_section(rem_sec_map.get(rem_code, ""))
+
+                course_hdr_lbl = timetable.format_course_label(rem_code, master_catalog_df)
+                status_tag = (
+                    f'<span class="cf-badge-ok">✅ Assigned: {html.escape(chosen_sec_for_rem)}</span>'
+                    if chosen_sec_for_rem
+                    else f'<span class="cf-source-pill">{len(clash_free_secs)} clash-free / {len(clashing_secs)} clashing</span>'
+                )
+                with st.expander(
+                    f"{course_hdr_lbl} — {len(clash_free_secs)} Clash-Free Option(s), {len(clashing_secs)} Clashing Option(s)",
+                    expanded=True,
+                ):
+                    _render_html(f'<div style="margin-bottom:0.4rem;">{status_tag}</div>')
+
+                    if clash_free_secs:
+                        for idx_cf, opt in enumerate(clash_free_secs):
+                            sec_lbl = str(opt["section"])
+                            is_picked = sec_lbl == chosen_sec_for_rem
+                            col_info, col_btn = st.columns([3.6, 1.35], gap="small")
                             _render_html(
                                 f"""
-                                <div class="cf-demo-row">
-                                    <span>
-                                        <strong style="color:#0f172a;">{html.escape(str(sw['course_label']))}</strong>
-                                        <span class="cf-source-pill" style="margin-left:0.35rem;">{html.escape(tag_txt)}</span>
-                                        <br><small style="color:#475569;">{html.escape(str(sw['schedule_summary']))}</small>
-                                    </span>
-                                    <span class="cf-pill-active">{html.escape(str(sw['from_section']))} → {html.escape(str(sw['to_section']))}</span>
+                                <div class="cf-alt-row cf-alt-row-zero">
+                                    <div>
+                                        <span class="cf-badge-ok">✅ NO CLASH</span>
+                                        <strong style="color:#0f172a;margin-left:0.45rem;">{html.escape(sec_lbl)}</strong>
+                                        <span class="cf-muted" style="margin-left:0.4rem;font-size:0.78rem;">· {html.escape(str(opt['days_summary']))}</span>
+                                        <div style="color:#1e293b;font-size:0.84rem;margin-top:0.22rem;">{html.escape(str(opt['schedule_summary']))}</div>
+                                        <div class="cf-muted" style="font-size:0.77rem;">Rooms: {html.escape(str(opt['room_summary']))} · Instructor: {html.escape(str(opt['instructor']))}</div>
+                                    </div>
+                                </div>
+                                """,
+                                target=col_info,
+                            )
+                            _render_html("<div style='height:0.45rem;'></div>", target=col_btn)
+                            if is_picked:
+                                if col_btn.button(
+                                    f"Selected: {sec_lbl} (Unselect)",
+                                    key=f"t4_unsel_{rem_code}_{sec_lbl}_{idx_cf}",
+                                    type="secondary",
+                                    width="stretch",
+                                ):
+                                    next_map = dict(rem_sec_map)
+                                    next_map.pop(rem_code, None)
+                                    st.session_state["t4_pending_updates"] = {
+                                        "t4_remaining_sections": next_map
+                                    }
+                                    st.rerun()
+                            else:
+                                if col_btn.button(
+                                    f"Select {sec_lbl} (No Clash)",
+                                    key=f"t4_sel_{rem_code}_{sec_lbl}_{idx_cf}",
+                                    type="primary",
+                                    width="stretch",
+                                ):
+                                    next_map = dict(rem_sec_map)
+                                    next_map[rem_code] = sec_lbl
+                                    st.session_state["t4_pending_updates"] = {
+                                        "t4_remaining_sections": next_map
+                                    }
+                                    st.rerun()
+                    else:
+                        smart_swap = timetable.find_smart_regular_section_swap(
+                            remaining_code=rem_code,
+                            regular_courses=regular_courses,
+                            regular_sections_map=regular_sections_map,
+                            master_catalog_df=master_catalog_df,
+                            locked_remaining_df=locked_others_df,
+                        )
+                        if smart_swap:
+                            sw_items = list(smart_swap["regular_swaps"])
+                            sw_desc = str(smart_swap["description"])
+                            st.warning(
+                                f"All sections of **{rem_code}** clash with your current regular classes. "
+                                f"**Smart Regular-Section Swap Available:** {sw_desc} "
+                                f"({smart_swap['remaining_summary']})."
+                            )
+                            if st.button(
+                                f"Apply Combined Swap ({sw_items[0]['course_code']} → {sw_items[0]['to_section']} + {rem_code} {smart_swap['remaining_target_section']})",
+                                key=f"t4_smart_swap_{rem_code}",
+                                type="primary",
+                                width="stretch",
+                            ):
+                                next_reg_swaps = dict(regular_swaps_map)
+                                for sw in sw_items:
+                                    next_reg_swaps[str(sw["course_code"])] = str(sw["to_section"])
+                                next_rem_secs = dict(rem_sec_map)
+                                next_rem_secs[rem_code] = str(smart_swap["remaining_target_section"])
+                                st.session_state["t4_pending_updates"] = {
+                                    "t4_regular_swaps": next_reg_swaps,
+                                    "t4_remaining_sections": next_rem_secs,
+                                }
+                                st.rerun()
+                        else:
+                            st.error(
+                                f"Every offering section for {rem_code} overlaps with your current regular timetable and no single regular-section swap clears it."
+                            )
+
+                    if clashing_secs:
+                        st.caption("Clashing sections across CS classes:")
+                        for opt_c in clashing_secs:
+                            _render_html(
+                                f"""
+                                <div class="cf-alt-row cf-alt-row-clash">
+                                    <div>
+                                        <span class="cf-badge-bad">❌ CLASH</span>
+                                        <strong style="color:#0f172a;margin-left:0.45rem;">{html.escape(str(opt_c['section']))}</strong>
+                                        <span style="color:#991b1b;font-size:0.83rem;font-weight:650;margin-left:0.45rem;">{html.escape(str(opt_c['conflict_text']))}</span>
+                                        <div class="cf-muted" style="font-size:0.78rem;margin-top:0.15rem;">{html.escape(str(opt_c['schedule_summary']))} · Instructor: {html.escape(str(opt_c['instructor']))}</div>
+                                    </div>
                                 </div>
                                 """
                             )
-                        if st.button(
-                            "Apply Suggested Alternatives & Finalize Timetable",
-                            key="cf_apply_joint_solution",
-                            type="primary",
-                            width="stretch",
-                        ):
-                            database.save_student_schedule(final_records)
-                            st.session_state["cf_student_plan"] = final_records
-                            pending_secs = {
-                                f"cf_extra_sec_{sw['course_code']}": sw["to_section"]
-                                for sw in swaps_list
-                                if not sw.get("is_regular")
-                            }
-                            if pending_secs:
-                                st.session_state["cf_pending_sec_updates"] = pending_secs
-                            st.rerun()
 
-                recommendations = timetable.recommend_slot_swaps(plan_df, catalog_df)
-                verified_single = [r for r in recommendations if r.get("resolves_all_clashes")]
-                partial_single = [r for r in recommendations if not r.get("resolves_all_clashes")]
-                if verified_single:
-                    st.markdown("##### Single-Course Clash-Free Alternative Sections")
-                    for idx, rec in enumerate(verified_single):
-                        with st.container(border=True):
-                            left, right = st.columns([4, 1.25], gap="medium")
-                            left.markdown(f"**{rec['course_label']}**")
-                            left.write(f"{rec['from_section']} → **{rec['to_section']}**")
-                            left.caption(str(rec["schedule_summary"]))
-                            left.markdown("<span class='cf-badge-ok'>0 remaining clashes</span>", unsafe_allow_html=True)
-                            if right.button(
-                                "Apply section",
-                                key=f"cf_apply_plan_swap_{idx}_{rec['course_code']}_{rec['to_section']}",
-                                width="stretch",
-                            ):
-                                remaining = plan_df.loc[
-                                    plan_df["course_code"].astype(str).str.upper() != str(rec["course_code"]).upper()
-                                ].copy()
-                                replacement = pd.DataFrame(
-                                    list(rec["replacement_slots"]),
-                                    columns=[
-                                        "course_code", "course_name", "section", "day",
-                                        "start_time", "end_time", "room", "instructor",
-                                    ],
-                                )
-                                candidate = pd.concat([remaining, replacement], ignore_index=True)
-                                if not timetable.detect_clashes(candidate).empty:
-                                    st.error("This alternative no longer produces a clash-free timetable.")
-                                else:
-                                    database.save_student_schedule(candidate.to_dict(orient="records"))
-                                    st.session_state["cf_student_plan"] = candidate.to_dict(orient="records")
-                                    st.rerun()
-                elif not swaps_list and not partial_single:
-                    st.info("No clash-free alternative section exists in the currently loaded catalogue for these conflicts.")
+    # Build Combined Merged Schedule (Regular Courses + Chosen Remaining Course Sections)
+    merged_frames: list[pd.DataFrame] = []
+    if not base_regular_df.empty:
+        reg_tagged = base_regular_df.copy()
+        reg_tagged["_course_kind"] = reg_tagged["course_code"].apply(
+            lambda c: "Regular (Swapped)" if str(c).upper() in regular_swaps_map else "Regular Class"
+        )
+        merged_frames.append(reg_tagged)
 
-                if partial_single and not (solver_meta.get("solved_zero_clash") and swaps_list):
-                    with st.expander("Partial alternatives that reduce overlaps", expanded=False):
-                        for rec in partial_single:
-                            st.write(
-                                f"{rec['course_code']} → {rec['to_section']}: "
-                                f"{rec['resulting_clashes']} clash(es) remain."
-                            )
+    for rem_c in selected_remaining:
+        chosen_s = timetable.normalize_class_section(rem_sec_map.get(rem_c, ""))
+        if not chosen_s:
+            continue
+        rem_rows = master_catalog_df.loc[
+            (master_catalog_df["course_code"].astype(str).str.upper() == rem_c)
+            & (norm_sec_col == chosen_s)
+        ].copy()
+        if not rem_rows.empty:
+            rem_rows["_course_kind"] = "Remaining / Repeater"
+            merged_frames.append(rem_rows)
 
-            st.markdown("#### 3. Final Personalized Weekly Timetable")
-            final_clashes = timetable.detect_clashes(plan_df)
-            if final_clashes.empty:
-                st.success("Conflict-free timetable — finalized and saved")
-            else:
-                st.warning(f"Timetable still has {len(final_clashes)} unresolved overlap(s) — apply alternatives above.")
+    if merged_frames:
+        final_schedule_df = pd.concat(merged_frames, ignore_index=True)
+        day_ord = {d: i for i, d in enumerate(timetable.COMSATS_ALL_DAYS)}
+        final_schedule_df["_d"] = final_schedule_df["day"].map(day_ord).fillna(99)
+        final_schedule_df = (
+            final_schedule_df.sort_values(["_d", "start_time", "course_code"])
+            .drop(columns=["_d"])
+            .reset_index(drop=True)
+        )
+    else:
+        final_schedule_df = master_catalog_df.iloc[0:0].copy()
+        final_schedule_df["_course_kind"] = []
 
-            _render_weekly_timetable(timetable.build_weekly_matrix(plan_df))
+    # Persist planner state & synchronize Top Header KPI Strip
+    final_records = final_schedule_df[
+        ["course_code", "course_name", "section", "day", "start_time", "end_time", "room", "instructor"]
+    ].to_dict(orient="records")
+    prog_p, sec_p = timetable.split_class_section(selected_regular_section)
+    database.save_planner_state(
+        {
+            "program": prog_p,
+            "section_code": sec_p,
+            "regular_section": selected_regular_section,
+            "pdf_filename": loaded_pdf_name,
+            "remaining_courses": list(selected_remaining),
+            "remaining_sections": dict(rem_sec_map),
+            "regular_swaps": dict(regular_swaps_map),
+        }
+    )
 
-            reg_set_disp = set(solver_meta.get("regular_courses") or regular_courses)
-            display_df = plan_df.copy()
-            display_df["Type"] = display_df["course_code"].apply(
-                lambda c: "Regular Class" if str(c).upper() in reg_set_disp else "Remaining / Extra"
-            )
-            display_df["Course"] = display_df["course_code"].apply(
-                lambda c: timetable.format_course_label(str(c), catalog_df)
-            )
-            display_df = display_df[["Type", "Course", "section", "instructor", "day", "start_time", "end_time", "room"]]
-            display_df.columns = ["Type", "Course", "Section", "Instructor", "Day", "Start", "End", "Room"]
-            st.dataframe(display_df, width="stretch", hide_index=True)
-            st.download_button(
-                "Download final timetable (CSV)",
-                data=display_df.to_csv(index=False).encode("utf-8"),
-                file_name="campusflow_final_timetable.csv",
-                mime="text/csv",
-            )
+    working_sig = sorted(
+        (str(r["course_code"]), str(r["section"]), str(r["day"]), str(r["start_time"]), str(r["end_time"]))
+        for r in final_records
+    )
+    saved_sig = sorted(
+        (str(r["course_code"]), str(r["section"]), str(r["day"]), str(r["start_time"]), str(r["end_time"]))
+        for r in student_saved_slots
+    )
+    if working_sig != saved_sig:
+        database.save_student_schedule(final_records)
+        st.rerun()
+
+    # -----------------------------------------------------------------------
+    # STEP 4: Final Merged Timetable Grid & 1-Click PDF Download
+    # -----------------------------------------------------------------------
+    final_clashes_df = timetable.detect_clashes(final_schedule_df)
+    unassigned_rems = [c for c in selected_remaining if not rem_sec_map.get(c)]
+    with st.container(border=True):
+        if final_clashes_df.empty and not unassigned_rems:
+            final_pill = '<span class="cf-badge-ok">✅ CONFLICT-FREE (0 CLASHES)</span>'
+        elif not final_clashes_df.empty:
+            final_pill = f'<span class="cf-badge-bad">❌ {len(final_clashes_df)} CLASH(ES)</span>'
         else:
+            final_pill = f'<span class="cf-source-pill">{len(unassigned_rems)} remaining course(s) pending section selection</span>'
+
+        _render_html(
+            f"""
+            <div class="cf-step-head">
+                <div class="cf-step-title-group">
+                    <span class="cf-step-pill">Step 4</span>
+                    <span class="cf-step-title">Final Merged Timetable Grid &amp; PDF Download</span>
+                </div>
+                {final_pill}
+            </div>
+            """
+        )
+
+        if unassigned_rems:
             st.info(
-                "Select your regular class and any remaining/extra courses above, then click "
-                "'Check Clashes, Prerequisites & Build Timetable'."
+                f"Click **Select [Section] (No Clash)** (or **Apply Combined Swap**) in Step 3 for: "
+                f"{', '.join(timetable.format_course_label(c, master_catalog_df) for c in unassigned_rems)}."
             )
 
-        with st.expander("COMSATS Fall 2026 Section Catalogue", expanded=False):
-            catalogue_view = catalog_df.copy()
-            catalogue_view["Course"] = catalogue_view["course_code"].apply(
-                lambda c: timetable.format_course_label(str(c), catalog_df)
+        if final_schedule_df.empty:
+            st.info("Select a regular class/section in Step 1 to generate your final merged timetable.")
+        else:
+            k1, k2, k3, k4 = st.columns(4, gap="small")
+            k1.metric("Enrolled Courses", int(final_schedule_df["course_code"].nunique()))
+            k2.metric("Weekly Classes & Labs", len(final_schedule_df))
+            k3.metric("Sections Combined", int(final_schedule_df["section"].nunique()))
+            k4.metric("Time Clashes", len(final_clashes_df))
+
+            _render_weekly_timetable(timetable.build_weekly_matrix(final_schedule_df))
+
+            summary_df = final_schedule_df.copy()
+            summary_df["Course"] = summary_df["course_code"].apply(
+                lambda c: timetable.format_course_label(str(c), master_catalog_df)
             )
-            catalogue_view = catalogue_view[["Course", "section", "instructor", "day", "start_time", "end_time", "room"]]
-            catalogue_view.columns = ["Course", "Section", "Instructor", "Day", "Start", "End", "Room"]
-            st.caption(catalog_source_note)
-            st.dataframe(catalogue_view, width="stretch", hide_index=True)
+            summary_df = summary_df[
+                ["_course_kind", "Course", "section", "day", "start_time", "end_time", "room", "instructor"]
+            ]
+            summary_df.columns = ["Type", "Course", "Section", "Day", "Start", "End", "Room", "Instructor"]
+            st.dataframe(summary_df, width="stretch", hide_index=True)
+
+            swaps_notes_pdf = [
+                f"Regular swap: {rc} moved {selected_regular_section} -> {new_sec}"
+                for rc, new_sec in regular_swaps_map.items()
+            ] + [
+                f"Remaining / Repeater: {rc} scheduled in {sec_r}"
+                for rc, sec_r in rem_sec_map.items()
+            ]
+            prereq_notes_pdf = [
+                f"{pw['headline']} ({pw['detail']})"
+                for pw in prereq_warnings
+            ]
+            final_pdf_bytes = timetable.generate_final_timetable_pdf(
+                cohort_label=f"{selected_regular_section} (Fall 2026)",
+                schedule_df=final_schedule_df,
+                swaps_applied=swaps_notes_pdf,
+                prereq_notes=prereq_notes_pdf,
+            )
+            dl_c1, dl_c2 = st.columns([2.2, 1], gap="small")
+            dl_c1.download_button(
+                "📄 Download Final Timetable (PDF)",
+                data=final_pdf_bytes,
+                file_name=f"campusflow_{selected_regular_section.lower()}_final_timetable.pdf",
+                mime="application/pdf",
+                type="primary",
+                width="stretch",
+            )
+            dl_c2.caption(f"Printable A4 Landscape PDF · {max(1, len(final_pdf_bytes) // 1024)} KB")
 
 ENHANCED_UI_JS = """
 <div data-cf-js-hook="true" style="display:none;"></div>

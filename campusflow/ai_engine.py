@@ -2988,10 +2988,15 @@ def parse_timetable_pdf_with_fallback(
     """
     Parse an uploaded university timetable PDF into normalized `(course_code, ..., instructor)` rows.
 
-    Returns `(rows, used_gemini_ai)`. Deterministic COMSATS parser runs first; if no rows
-    are recognized and Gemini API is configured, uses Gemini structured extraction.
+    Returns `(rows, used_gemini_ai)`. Pure-Python geometric + tabular PDF parsing runs first
+    (zero `.env` or API key required), followed by plain-text COMSATS extraction, and falls back
+    to Gemini structured extraction only for scanned/non-text PDFs when configured.
     """
     import timetable as tt
+
+    geom_df = tt.parse_timetable_pdf_bytes(pdf_bytes)
+    if not geom_df.empty:
+        return geom_df.to_dict("records"), False
 
     raw_text = _extract_pdf_text_for_timetable(pdf_bytes)
     if raw_text:

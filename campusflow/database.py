@@ -152,6 +152,29 @@ def init_db(db_path: Path | str | None = None) -> None:
                 room TEXT NOT NULL DEFAULT '',
                 instructor TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS uploaded_timetable_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_key TEXT NOT NULL DEFAULT 'local-demo',
+                file_name TEXT NOT NULL DEFAULT '',
+                course_code TEXT NOT NULL,
+                course_name TEXT NOT NULL DEFAULT '',
+                section TEXT NOT NULL,
+                day TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                room TEXT NOT NULL DEFAULT '',
+                instructor TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS student_planner_state (
+                student_key TEXT PRIMARY KEY,
+                program TEXT NOT NULL DEFAULT 'BCS',
+                section_code TEXT NOT NULL DEFAULT '1A',
+                pdf_filename TEXT NOT NULL DEFAULT '',
+                state_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
             """
         )
         # Lightweight forward migrations for existing SQLite files
@@ -1734,3 +1757,122 @@ def save_student_schedule(
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(student_key, *row) for row in normalized],
         )
+
+
+def save_uploaded_pdf_catalog(
+    slots: list[dict[str, Any]],
+    file_name: str = "",
+    student_key: str = "local-demo",
+    db_path: Path | str | None = None,
+) -> None:
+    """Persist rows parsed from an uploaded Timetable PDF for zero-dependency reloads."""
+    init_db(db_path)
+    required = ("course_code", "course_name", "section", "day", "start_time", "end_time", "room", "instructor")
+    normalized = [
+        tuple(str(slot.get(key) or "") for key in required)
+        for slot in slots
+        if str(slot.get("course_code") or "").strip()
+    ]
+    with _get_connection(db_path) as conn:
+        conn.execute("DELETE FROM uploaded_timetable_slots WHERE student_key = ?", (student_key,))
+        if normalized:
+            conn.executemany(
+                "INSERT INTO uploaded_timetable_slots "
+                "(student_key, file_name, course_code, course_name, section, day, start_time, end_time, room, instructor) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(student_key, str(file_name or ""), *row) for row in normalized],
+            )
+
+
+def load_uploaded_pdf_catalog(
+    student_key: str = "local-demo",
+    db_path: Path | str | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Return `(slots, uploaded_pdf_filename)` previously parsed for this student."""
+    init_db(db_path)
+    with _get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT file_name, course_code, course_name, section, day, start_time, end_time, room, instructor "
+            "FROM uploaded_timetable_slots WHERE student_key = ? ORDER BY id ASC",
+            (student_key,),
+        ).fetchall()
+    if not rows:
+        return [], ""
+    fname = str(rows[0]["file_name"] or "")
+    slots = [
+        {
+            "course_code": r["course_code"],
+            "course_name": r["course_name"],
+            "section": r["section"],
+            "day": r["day"],
+            "start_time": r["start_time"],
+            "end_time": r["end_time"],
+            "room": r["room"],
+            "instructor": r["instructor"],
+        }
+        for r in rows
+    ]
+    return slots, fname
+
+
+def clear_uploaded_pdf_catalog(
+    student_key: str = "local-demo",
+    db_path: Path | str | None = None,
+) -> None:
+    """Clear stored uploaded Timetable PDF catalog rows."""
+    init_db(db_path)
+    with _get_connection(db_path) as conn:
+        conn.execute("DELETE FROM uploaded_timetable_slots WHERE student_key = ?", (student_key,))
+
+
+def save_planner_state(
+    state_dict: dict[str, Any],
+    student_key: str = "local-demo",
+    db_path: Path | str | None = None,
+) -> None:
+    """Persist Tab 4 Class/Section, failed courses, passed prerequisites, and section overrides."""
+    init_db(db_path)
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    prog = str(state_dict.get("program") or "BCS").upper()
+    sec = str(state_dict.get("section_code") or "1A").upper()
+    pdf_name = str(state_dict.get("pdf_filename") or "")
+    payload = json.dumps(state_dict, ensure_ascii=False)
+    with _get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO student_planner_state (student_key, program, section_code, pdf_filename, state_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(student_key) DO UPDATE SET
+                program = excluded.program,
+                section_code = excluded.section_code,
+                pdf_filename = excluded.pdf_filename,
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
+            """,
+            (student_key, prog, sec, pdf_name, payload, now_str),
+        )
+
+
+def load_planner_state(
+    student_key: str = "local-demo",
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Load persisted Tab 4 planner state dictionary (returns empty dict if none saved)."""
+    init_db(db_path)
+    with _get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT program, section_code, pdf_filename, state_json FROM student_planner_state WHERE student_key = ?",
+            (student_key,),
+        ).fetchone()
+    if row is None:
+        return {}
+    try:
+        data = json.loads(row["state_json"] or "{}")
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        data.setdefault("program", row["program"])
+        data.setdefault("section_code", row["section_code"])
+        data.setdefault("pdf_filename", row["pdf_filename"])
+        return data
+    return {}

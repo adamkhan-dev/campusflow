@@ -18,6 +18,7 @@ if str(CAMPUSFLOW_DIR) not in sys.path:
 import ai_engine  # noqa: E402
 import database  # noqa: E402
 import timetable  # noqa: E402
+import pandas as pd
 from pydantic import ValidationError  # noqa: E402
 
 
@@ -664,6 +665,95 @@ class TestTimetableSolver(unittest.TestCase):
             self.assertTrue(adv_fb)
             self.assertIn("AIC354: BCS-5A → BCS-5B", adv_text)
 
+    def test_pure_python_pdf_extraction_prereq_chains_all_classes_search_and_fpdf2_export(self) -> None:
+        # 1. Sample COMSATS Fall 2026 PDF generation & pure-Python PDF parsing (zero .env)
+        sample_pdf_bytes = timetable.generate_sample_comsats_pdf_bytes()
+        self.assertTrue(sample_pdf_bytes.startswith(b"%PDF-"))
+        with mock.patch.object(ai_engine, "is_api_configured", return_value=False):
+            parsed_rows, used_ai = ai_engine.parse_timetable_pdf_with_fallback(sample_pdf_bytes)
+        self.assertFalse(used_ai)
+        parsed_df = timetable.slots_list_to_df(parsed_rows)
+        self.assertEqual(len(parsed_df), 54)
+        self.assertEqual(
+            set(parsed_df["section"].unique()),
+            {"BCS-1A", "BCS-1B", "BSE-1", "BAI-1", "BDS-1", "BCT-1"},
+        )
+
+        # 2. Prerequisite chain impact analysis for failed & retake courses
+        findings = timetable.analyze_prerequisite_chains(
+            enrolled_courses=["CSC101", "CSC103", "CSC325"],
+            failed_courses=["CSC101", "CSC103"],
+            passed_courses=["HUM104"],
+        )
+        headlines = [f["headline"] for f in findings]
+        self.assertTrue(any("CSC325: Prerequisite Blocker (CSC101)" in h for h in headlines))
+        self.assertTrue(any("CSC103 Failed/Retake Chain Impact" in h for h in headlines))
+
+        # 3. Search all other classes in uploaded PDF for a clashing repeat course
+        bcs_1a = parsed_df.loc[parsed_df["section"] == "BCS-1A"].copy()
+        other_than_103 = bcs_1a.loc[bcs_1a["course_code"] != "CSC103"].copy()
+        alts = timetable.find_alternative_classes_in_pdf(
+            course_code="CSC103",
+            other_schedule_df=other_than_103,
+            pdf_catalog_df=parsed_df,
+            current_section="BCS-1B",
+        )
+        zero_clash_secs = {a["section"] for a in alts if not a["has_clash"]}
+        clash_secs = {a["section"] for a in alts if a["has_clash"]}
+        self.assertIn("BSE-1", zero_clash_secs)
+        self.assertIn("BCS-1A", zero_clash_secs)
+        self.assertIn("BCS-1B", clash_secs)
+
+        # 4. Build final clash-free timetable (BCS-1A regular + CSC103 retake in BSE-1) & export via fpdf2
+        bse1_103 = parsed_df.loc[(parsed_df["section"] == "BSE-1") & (parsed_df["course_code"] == "CSC103")]
+        final_df = pd.concat([other_than_103, bse1_103], ignore_index=True)
+        self.assertTrue(timetable.detect_clashes(final_df).empty)
+        final_pdf = timetable.generate_final_timetable_pdf(
+            cohort_label="BCS-1A (Fall 2026)",
+            schedule_df=final_df,
+            swaps_applied=["CSC103: BCS-1B -> BSE-1"],
+            prereq_notes=["CSC103 Failed/Retake Chain Impact"],
+        )
+        self.assertTrue(final_pdf.startswith(b"%PDF-"))
+        self.assertGreater(len(final_pdf), 1500)
+        roundtrip_df = timetable.parse_timetable_pdf_bytes(final_pdf)
+        self.assertGreaterEqual(len(roundtrip_df), len(final_df))
+
+        # 5. Full CS Master Catalog (14 regular sections + RPT-CS), remaining clash check & smart regular swap
+        master_df = timetable.get_cs_master_catalog_df()
+        self.assertEqual(len(master_df["section"].unique()), 15)
+        for sec in master_df["section"].unique():
+            self.assertTrue(
+                timetable.detect_clashes(master_df.loc[master_df["section"] == sec]).empty,
+                f"Internal clash found in master section {sec}",
+            )
+        bcs5a_df = master_df.loc[master_df["section"] == "BCS-5A"].copy()
+        bcs5a_courses = list(bcs5a_df["course_code"].unique())
+        pw = timetable.check_failed_prereq_impacts_for_regular(
+            regular_courses=bcs5a_courses,
+            failed_courses=["CSC103", "CSC211"],
+            catalog_df=master_df,
+        )
+        self.assertEqual([item["failed_code"] for item in pw], ["CSC103", "CSC211"])
+
+        csc103_checks = timetable.analyze_remaining_course_sections("CSC103", bcs5a_df, master_df)
+        self.assertIn("BDS-1", {x["section"] for x in csc103_checks if not x["has_clash"]})
+        self.assertIn("RPT-CS", {x["section"] for x in csc103_checks if not x["has_clash"]})
+        self.assertIn("BCS-1A", {x["section"] for x in csc103_checks if x["has_clash"]})
+
+        eee_checks = timetable.analyze_remaining_course_sections("EEE241", bcs5a_df, master_df)
+        self.assertTrue(all(x["has_clash"] for x in eee_checks))
+        smart_swap = timetable.find_smart_regular_section_swap(
+            remaining_code="EEE241",
+            regular_courses=bcs5a_courses,
+            regular_sections_map={c: "BCS-5A" for c in bcs5a_courses},
+            master_catalog_df=master_df,
+        )
+        self.assertIsNotNone(smart_swap)
+        self.assertEqual(smart_swap["remaining_target_section"], "BCS-2A")
+        self.assertEqual(smart_swap["regular_swaps"][0]["course_code"], "CSC322")
+        self.assertEqual(smart_swap["regular_swaps"][0]["to_section"], "BCS-5B")
+
 
 class TestSeedingAndTimetablePersistence(unittest.TestCase):
     def setUp(self) -> None:
@@ -734,7 +824,7 @@ class TestStreamlitUI(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def test_zero_emojis_and_full_width_css(self) -> None:
-        allowed_ui_icons = {"✨", "⚡", "👍", "👎"}
+        allowed_ui_icons = {"✨", "⚡", "👍", "👎", "✅", "❌", "📄"}
         for rel in ("app.py", "timetable.py"):
             content = (CAMPUSFLOW_DIR / rel).read_text(encoding="utf-8")
             disallowed = [ch for ch in content if ord(ch) > 0x2600 and ch not in allowed_ui_icons]
@@ -806,7 +896,7 @@ class TestStreamlitUI(unittest.TestCase):
         self.assertIn("Fall 2026", all_md)
         self.assertIn("CSC322 — Operating Systems", all_md)
         self.assertIn("FCFS CPU Scheduling", all_md)
-        self.assertIn("1 Time Clash", all_md)
+        self.assertIn("All Clear", all_md)
         self.assertIn("Question 1 of 10", all_md)
 
         btn_labels = [b.label for b in at.button]
@@ -900,34 +990,70 @@ class TestStreamlitUI(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertIn("Answer", "\n".join(m.value for m in at.markdown))
 
-        # Schedule: Run COMSATS Timetable & Clash/Prerequisite Solver cleanly
+        # Schedule: 4-step CS Master Timetable, Remaining/Repeater Clash Solver, Smart Swap & PDF Export
+        sample_pdf_bytes = timetable.generate_sample_comsats_pdf_bytes()
         with mock.patch.object(ai_engine, "is_api_configured", return_value=False):
-            check_btn = next(
-                b
-                for b in at.tabs[3].button
-                if b.label == "Check Clashes, Prerequisites & Build Timetable"
-            )
-            check_btn.click().run()
+            # Step 1: Select BCS-5A -> regular courses auto-load without manual selection
+            at.tabs[3].selectbox(key="t4_regular_section").select("BCS-5A").run()
             self.assertFalse(at.exception)
-            tab4_clashing_md = "\n".join(m.value for m in at.tabs[3].markdown)
-            self.assertIn("cf-advisor-box", tab4_clashing_md)
-            self.assertIn("Recommended Clash-Free Alternative Classes", tab4_clashing_md)
-            self.assertTrue(any("timetable clash(es) detected" in w.value for w in at.tabs[3].warning))
+            tab4_reg_md = "\n".join(m.value for m in at.tabs[3].markdown)
+            self.assertIn("Base Regular Weekly Timetable — BCS-5A", tab4_reg_md)
+            self.assertIn("CSC322", tab4_reg_md)
 
-            apply_joint_btn = next(
-                b
-                for b in at.tabs[3].button
-                if b.label == "Apply Suggested Alternatives & Finalize Timetable"
-            )
-            apply_joint_btn.click().run()
+            # Optional PDF Upload merges cleanly into CS Master Timetable
+            at.tabs[3].file_uploader(key="t4_pdf_uploader").upload(
+                "comsats_fall_2026.pdf", sample_pdf_bytes, "application/pdf"
+            ).run()
             self.assertFalse(at.exception)
-            self.assertTrue(any("Conflict-free timetable" in s.value for s in at.tabs[3].success))
+            self.assertTrue(
+                any("Merged 54 PDF slots" in s.value for s in at.tabs[3].success)
+            )
+
+            # Step 2 & 3: Select failed/remaining course CSC103 -> Prereq Warning + Green BDS-1 Option
+            at.tabs[3].multiselect(key="t4_remaining_courses").select("CSC103").run()
+            self.assertFalse(at.exception)
+            self.assertTrue(
+                any("Prerequisite Warning: CSC103" in w.value for w in at.tabs[3].warning)
+            )
+            tab4_chk_md = "\n".join(m.value for m in at.tabs[3].markdown)
+            self.assertIn("✅ NO CLASH", tab4_chk_md)
+            self.assertIn("❌ CLASH", tab4_chk_md)
+
+            bds_btn = next(
+                b for b in at.tabs[3].button if b.label == "Select BDS-1 (No Clash)"
+            )
+            self.assertEqual(bds_btn.label, "Select BDS-1 (No Clash)")
+            rpt_btn = next(
+                b for b in at.tabs[3].button if b.label == "Select RPT-CS (No Clash)"
+            )
+            rpt_btn.click().run()
+            self.assertFalse(at.exception)
+
+            # Also pick EEE241 where all offerings clash -> Apply 1-click Smart Regular-Section Swap
+            at.tabs[3].multiselect(key="t4_remaining_courses").select("EEE241").run()
+            self.assertFalse(at.exception)
+            swap_btn = next(
+                b for b in at.tabs[3].button if b.label.startswith("Apply Combined Swap")
+            )
+            swap_btn.click().run()
+            self.assertFalse(at.exception)
+
+            tab4_final_md = "\n".join(m.value for m in at.tabs[3].markdown)
+            self.assertIn("✅ CONFLICT-FREE (0 CLASHES)", tab4_final_md)
             self.assertIn("All Clear", "\n".join(m.value for m in at.markdown))
+            dl_btns = [
+                d
+                for d in at.get("download_button")
+                if d.label == "📄 Download Final Timetable (PDF)"
+            ]
+            self.assertEqual(len(dl_btns), 1)
 
-            clear_plan_btn = next(b for b in at.tabs[3].button if b.label == "Clear saved plan")
-            clear_plan_btn.click().run()
+            # Reset uploaded PDF catalog cleanly
+            reset_pdf_btn = next(
+                b for b in at.tabs[3].button if b.label == "Reset to Built-in Master"
+            )
+            reset_pdf_btn.click().run()
             self.assertFalse(at.exception)
-            self.assertIn("1 Time Clash", "\n".join(m.value for m in at.markdown))
 
     def test_instant_sample_kit_and_single_or_multi_file_process_lecture_in_ui(self) -> None:
         from streamlit.testing.v1 import AppTest
